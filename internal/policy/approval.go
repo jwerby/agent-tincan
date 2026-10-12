@@ -52,6 +52,8 @@ func LoadApproval(path string) (*Approval, error) {
 
 var approvalName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
+const wildcardTarget = "*"
+
 func (a *Approval) reload() error {
 	entry, err := os.Lstat(a.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -112,7 +114,7 @@ func (a *Approval) reload() error {
 		return errors.New("invalid approval notify agent")
 	}
 	for target, rule := range c.Gate {
-		if !approvalName.MatchString(target) {
+		if target != wildcardTarget && !approvalName.MatchString(target) {
 			return errors.New("invalid approval target")
 		}
 		if (len(rule.From) == 0) == (rule.Unless == nil) {
@@ -156,7 +158,7 @@ func (a *Approval) Held(req *envelope.Request) (bool, error) {
 	if a.good == nil || (err == nil && a.missing) {
 		return false, err
 	}
-	rule, ok := a.good.Gate[req.To]
+	rule, ok := a.good.rule(req.To)
 	if !ok {
 		return false, nil
 	}
@@ -181,9 +183,17 @@ func (a *Approval) Held(req *envelope.Request) (bool, error) {
 	return false, nil
 }
 
-// holdDefaults reports whether the policy Held last read has an entry for
-// target, and the hold TTL and notify target a default hold should use: the
-// file's, or 2 hours and no notice when there is no file. Nil-safe.
+func (c approvalConfig) rule(target string) (approvalRule, bool) {
+	if rule, ok := c.Gate[target]; ok {
+		return rule, true
+	}
+	if target == wildcardTarget {
+		return approvalRule{}, false
+	}
+	rule, ok := c.Gate[wildcardTarget]
+	return rule, ok
+}
+
 func (a *Approval) holdDefaults(target string) (entry bool, ttl time.Duration, notify string) {
 	if a != nil {
 		a.mu.Lock()

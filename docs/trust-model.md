@@ -181,6 +181,13 @@ one of `from` and `unless` is required per target. Client-supplied identities,
 chains and statuses cannot bypass the check, which runs after the relay's
 cycle, hop and rate checks and before delivery. Both asks and notifies are gated.
 
+A gate key of `"*"` holds every target that has no entry of its own. It is an
+explicit opt-in, and it matches that one key only. `muse*`, `*muse`, and `**`
+are rejected. A named entry wins over `"*"`. `"*"` does not count as the named
+entry that turns off the council and dot-web defaults, so
+`{"gate":{"*":{"from":[]}}}` still holds those kinds. A named empty list still
+opens that one agent, as in `{"gate":{"council":{"from":[]}}}`.
+
 A missing file disables the gate for every target except agents of kind
 `council` and `dot-web`, which are held by default (see [Council](#council)). The relay reloads changed files. Unreadable,
 malformed or group/world-accessible policies hold every request to every target

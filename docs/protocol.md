@@ -147,6 +147,9 @@ Files live in an `attachments` directory (0700, files 0600) beside the relay dat
 ### Owner approval
 
 With an owner-configured `approval.json`, sends can enter non-terminal `held`.
+A gate key of `"*"` holds targets with no entry of their own. A named entry
+wins, and `"*"` does not turn off the council or dot-web defaults.
+
 A held send response has an optional `status: "held"` field; ordinary send
 responses remain unchanged. Get-reply and trace report `held` in their existing
 status field. Older clients can decode this unknown string and keep waiting.
