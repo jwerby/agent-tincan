@@ -185,10 +185,13 @@ func TestOnboardWithNoConfigHasNoRejoinHint(t *testing.T) {
 // --listen is fully parsed before the relay creates its state dir or
 // database.
 func TestRelayRejectsBadListenBeforeCreatingState(t *testing.T) {
-	for _, listen := range []string{"127.0.0.1", "100.not-an-ip", "100.64.1", "100.64.1.2.3", "100.64.1.2:notaport", "100.64.1.2:0", "100.64.1.2:70000", "[::1]:80", "::1", "tincan-relay"} {
+	prev := confirmTailnetPeer
+	confirmTailnetPeer = func(string) (bool, error) { return false, nil }
+	t.Cleanup(func() { confirmTailnetPeer = prev })
+	for _, listen := range []string{"127.0.0.1", "0.0.0.0", "100.not-an-ip", "100.64.1", "100.64.1.2.3", "100.64.1.2:notaport", "100.64.1.2:0", "100.64.1.2:70000", "100.0.0.1", "100.128.0.1", "[::1]:80", "::1", "fd7a:115c:a1e1::1", "tincan-relay"} {
 		dir := filepath.Join(t.TempDir(), "state")
 		err := runRelay(context.Background(), relayFlags{listen: listen, stateDir: dir, port: 8787})
-		if err == nil || !strings.Contains(err.Error(), "--listen must be a tailnet 100.x address") {
+		if err == nil || !strings.Contains(err.Error(), "--listen must be a Tailscale address") {
 			t.Fatalf("%q: err = %v", listen, err)
 		}
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {
@@ -198,16 +201,49 @@ func TestRelayRejectsBadListenBeforeCreatingState(t *testing.T) {
 }
 
 func TestListenAddr(t *testing.T) {
+	prev := confirmTailnetPeer
+	confirmTailnetPeer = func(string) (bool, error) { return false, nil }
+	t.Cleanup(func() { confirmTailnetPeer = prev })
 	for in, want := range map[string]string{
-		"100.64.1.2":      "100.64.1.2:8787",
-		" 100.64.1.2 ":    "100.64.1.2:8787",
-		"100.101.102.103": "100.101.102.103:8787",
-		"100.64.1.2:9000": "100.64.1.2:9000",
+		"100.64.1.2":               "100.64.1.2:8787",
+		" 100.64.1.2 ":             "100.64.1.2:8787",
+		"100.64.0.0":               "100.64.0.0:8787",
+		"100.101.102.103":          "100.101.102.103:8787",
+		"100.127.255.255":          "100.127.255.255:8787",
+		"100.64.1.2:9000":          "100.64.1.2:9000",
+		"fd7a:115c:a1e0::1":        "[fd7a:115c:a1e0::1]:8787",
+		"[fd7a:115c:a1e0::1]":      "[fd7a:115c:a1e0::1]:8787",
+		"[fd7a:115c:a1e0::1]:8787": "[fd7a:115c:a1e0::1]:8787",
+		"fd7a:115c:a1e0::":         "[fd7a:115c:a1e0::]:8787",
+		"fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff": "[fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff]:8787",
 	} {
 		got, err := listenAddr(in, 8787)
 		if err != nil || got != want {
 			t.Errorf("listenAddr(%q) = %q, %v; want %q", in, got, err, want)
 		}
+	}
+	for _, in := range []string{"100.63.255.255", "100.128.0.0", "100.0.0.1", "203.0.113.5", "fd7a:115c:a1e1::1", "example.com"} {
+		if _, err := listenAddr(in, 8787); err == nil || !strings.Contains(err.Error(), "--listen must be a Tailscale address") {
+			t.Errorf("listenAddr(%q) err = %v", in, err)
+		}
+	}
+}
+
+func TestListenAddrWhoisAllowsOutOfRangePeer(t *testing.T) {
+	prev := confirmTailnetPeer
+	confirmTailnetPeer = func(addr string) (bool, error) {
+		if addr != "203.0.113.5:8787" {
+			t.Errorf("whois called for %s", addr)
+		}
+		return true, nil
+	}
+	t.Cleanup(func() { confirmTailnetPeer = prev })
+	got, err := listenAddr("203.0.113.5", 8787)
+	if err != nil || got != "203.0.113.5:8787" {
+		t.Fatalf("listenAddr = %q, %v", got, err)
+	}
+	if _, err := listenAddr("100.64.1.2", 8787); err != nil {
+		t.Fatal(err)
 	}
 }
 
