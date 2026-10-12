@@ -59,6 +59,9 @@ and key, a compromised relay host, or another process running as the relay
 user. Keep the state directory and its parents under the operator's control;
 this is not a hostile-filesystem sandbox or a power-loss durability guarantee.
 
+On startup the relay sets each directory in the state directory to 0700 and
+each other file to 0600. It does not change a symlink.
+
 ## Rebuilt machines
 
 Rebuilding a sandbox or VM usually creates a new Tailscale node: a new stable node ID and IP under the same machine name, or that name with a `-1` style suffix if the old node has not expired yet. The relay re-admits such a machine as its old agent on its first call, with no new invite, when all of these hold:

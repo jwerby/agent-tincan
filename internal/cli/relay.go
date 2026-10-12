@@ -393,6 +393,9 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	if err := os.MkdirAll(f.stateDir, 0o700); err != nil {
 		return err
 	}
+	if err := secureStateDir(f.stateDir); err != nil {
+		return err
+	}
 	pepper, err := loadOrCreateInvitePepper(f.stateDir)
 	if err != nil {
 		return err
@@ -403,6 +406,9 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	}
 	st, err := store.Open(filepath.Join(f.stateDir, "relay.db"))
 	if err != nil {
+		return err
+	}
+	if err := secureStateDir(f.stateDir); err != nil {
 		return err
 	}
 	closeStore := sync.OnceFunc(func() {
@@ -511,6 +517,9 @@ func runRelay(ctx context.Context, f relayFlags) error {
 		go func() { errc <- gw.Serve(gln) }()
 		servers = append(servers, gw)
 		log.Printf("chatgpt gateway serving at %s/mcp", base)
+	}
+	if err := secureStateDir(f.stateDir); err != nil {
+		return err
 	}
 	log.Printf("tincan relay serving on %s (admin socket %s)", ln.Addr(), adminSock)
 
