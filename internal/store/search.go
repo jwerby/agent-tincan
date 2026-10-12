@@ -109,7 +109,7 @@ func (s *Store) Search(ctx context.Context, query, participant string, limit int
 	if participant == "" {
 		// Admins search the whole index, newest searchCandidateLimit matches.
 		return s.searchRows(ctx, `SELECT rowid,`+searchExcerpts+` FROM requests_fts
- WHERE requests_fts MATCH ? ORDER BY rowid DESC LIMIT ?`, limit, match, searchCandidateLimit)
+ WHERE requests_fts MATCH ? AND rowid IN (SELECT rowid FROM requests WHERE gate_action = '') ORDER BY rowid DESC LIMIT ?`, limit, match, searchCandidateLimit)
 	}
 	// An agent searches only its own chains, and never a request held for
 	// the owner and not approved unless it sent it (see RedactFor). Walk them newest first in
@@ -122,7 +122,7 @@ func (s *Store) Search(ctx context.Context, query, participant string, limit int
 		var chunkLow int64
 		var chunkRows int
 		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(rowid), 0), COUNT(*) FROM (
- SELECT r.rowid FROM requests r WHERE r.rowid < ? AND r.trace_id IN (
+ SELECT r.rowid FROM requests r WHERE r.rowid < ? AND r.gate_action = '' AND r.trace_id IN (
    SELECT trace_id FROM requests WHERE from_agent = ?
    UNION SELECT trace_id FROM requests WHERE to_agent = ?
  ) ORDER BY r.rowid DESC LIMIT ?)`, below, participant, participant, searchVisibleWindow).Scan(&chunkLow, &chunkRows); err != nil {
@@ -134,7 +134,7 @@ func (s *Store) Search(ctx context.Context, query, participant string, limit int
 		hits, err := s.searchRows(ctx, `SELECT rowid,`+searchExcerpts+` FROM requests_fts
  WHERE requests_fts MATCH ? AND rowid >= ? AND rowid < ? AND rowid IN (
    SELECT r.rowid FROM requests r WHERE r.rowid >= ? AND r.rowid < ?
-     AND NOT (r.was_held = 1 AND r.approved = 0 AND r.from_agent != ?) AND r.trace_id IN (
+     AND r.gate_action = '' AND NOT (r.was_held = 1 AND r.approved = 0 AND r.from_agent != ?) AND r.trace_id IN (
      SELECT trace_id FROM requests WHERE from_agent = ?
      UNION SELECT trace_id FROM requests WHERE to_agent = ?
    ))

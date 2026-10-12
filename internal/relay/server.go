@@ -124,6 +124,13 @@ type Preparer interface {
 	Prepare(ctx context.Context, req *envelope.Request) error
 }
 
+// DeliveryGater is an optional Preparer that also holds replies and
+// clarification answers. A preparer that does not implement it leaves those
+// paths ungated.
+type DeliveryGater interface {
+	HoldDelivery(ctx context.Context, req *envelope.Request) (bool, error)
+}
+
 // Refunder is an optional Preparer that gives back what Prepare took (the
 // urgent allowance) when the relay then fails to queue the request.
 type Refunder interface {
@@ -1051,7 +1058,7 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errAttachmentsOff)
 		return
 	}
-	rep, err = s.recordReply(r.Context(), r.PathValue("id"), name, rep, "", 0)
+	rep, err = s.recordReply(r.Context(), r.PathValue("id"), name, rep, "", 0, false)
 	if err != nil {
 		writeErr(w, attachmentStatus(err, statusFor(err)), err)
 		return
@@ -1067,7 +1074,12 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 // An email reply is stored with its email_replies row in one transaction
 // (store.ReplyByEmail) and audited with via "email"; its tag, sender and
 // text never reach the audit log.
-func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope.Reply, emailMessageID string, round int) (envelope.Reply, error) {
+func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope.Reply, emailMessageID string, round int, skipGate bool) (envelope.Reply, error) {
+	if !skipGate {
+		if held, stop, err := s.holdReply(ctx, id, agent, rep, emailMessageID, round); stop || err != nil {
+			return held, err
+		}
+	}
 	var err error
 	if emailMessageID == "" {
 		rep, err = s.store.Reply(ctx, id, agent, rep)
@@ -1717,7 +1729,7 @@ func statusFor(err error) int {
 	case errors.Is(err, store.ErrForbidden), errors.Is(err, identity.ErrNotAdmin), errors.Is(err, identity.ErrNotJoined),
 		errors.Is(err, identity.ErrAgentAmbiguous):
 		return http.StatusForbidden
-	case errors.Is(err, store.ErrWrongState):
+	case errors.Is(err, store.ErrWrongState), errors.Is(err, store.ErrPendingHold):
 		return http.StatusConflict
 	case errors.Is(err, identity.ErrBadInvite):
 		return http.StatusBadRequest
@@ -1894,6 +1906,15 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Sweep(r.Context())
 	id := r.PathValue("id")
+	action, err := s.store.GateAction(r.Context(), id)
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	if action != "" {
+		s.approveDelivery(w, r, id, action)
+		return
+	}
 	ttl := s.cfg.RequestTTL
 	if held, _, err := s.store.Request(r.Context(), id); err == nil {
 		ttl = s.requestTTL(r.Context(), held.To)

@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
-	"github.com/mvanhorn/agent-tincan/internal/store"
 )
 
 func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
@@ -30,16 +29,19 @@ func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if held, stop, err := s.holdAnswer(r.Context(), r.PathValue("id"), name, in.Body); stop || err != nil {
+		if err != nil {
+			writeErr(w, statusFor(err), err)
+			return
+		}
+		writeJSON(w, http.StatusOK, held)
+		return
+	}
 	req, err := s.store.Answer(r.Context(), r.PathValue("id"), name, in.Body)
 	if err != nil {
 		writeErr(w, statusFor(err), err)
 		return
 	}
-	s.record(r.Context(), "answered_input", req.ID, req.TraceID, name, store.DetailJSON(map[string]any{"answer_bytes": len(in.Body)}))
-	s.hub.notify(requestKey(req.ID))
-	s.hub.notify(inboxKey(req.To))
-	if s.events != nil {
-		s.events.Queued(r.Context(), req)
-	}
+	s.publishAnswer(r.Context(), req, name, in.Body)
 	writeJSON(w, http.StatusOK, req)
 }

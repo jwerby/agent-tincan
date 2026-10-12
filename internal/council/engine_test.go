@@ -52,8 +52,13 @@ func newCouncilRig(t *testing.T, rc relay.Config) *councilRig {
 
 // gate holds asks to target while from is in the chain.
 func (r *councilRig) gate(target, from string) {
+	r.loadGate(fmt.Sprintf(`{%q:{"from":[%q]}}`, target, from))
+}
+
+func (r *councilRig) loadGate(rules string) {
+	body := []byte(`{"gate":` + rules + `}`)
 	path := filepath.Join(r.t.TempDir(), "approval.json")
-	if err := os.WriteFile(path, fmt.Appendf(nil, `{"gate":{%q:{"from":[%q]}}}`, target, from), 0o600); err != nil {
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		r.t.Fatal(err)
 	}
 	a, err := policy.LoadApproval(path)
@@ -320,7 +325,7 @@ func TestCouncilFailsWithTwoAnswers(t *testing.T) {
 // its reason and unscored, and review runs with the rest.
 func TestCouncilAbsentMembersAreNotScored(t *testing.T) {
 	r := newCouncilRig(t, relay.Config{})
-	r.gate("gated", "codex")
+	r.loadGate(`{"gated":{"from":["codex"]},"council":{"from":[]}}`)
 	for _, n := range []string{"alpha", "bravo", "charlie", "delta"} {
 		r.member(n, honest(n, ""))
 	}

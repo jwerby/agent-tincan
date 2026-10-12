@@ -194,7 +194,7 @@ func (c approvalConfig) rule(target string) (approvalRule, bool) {
 	return rule, ok
 }
 
-func (a *Approval) holdDefaults(target string) (entry bool, ttl time.Duration, notify string) {
+func (a *Approval) exactGate(target string) (exact bool, ttl time.Duration, notify string) {
 	if a != nil {
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -202,8 +202,8 @@ func (a *Approval) holdDefaults(target string) (entry bool, ttl time.Duration, n
 	if a == nil || a.good == nil || a.missing {
 		return false, defaultHoldTTL, ""
 	}
-	_, entry = a.good.Gate[target]
-	return entry, a.ttl, a.good.Notify
+	_, exact = a.good.Gate[target]
+	return exact, a.ttl, a.good.Notify
 }
 
 // Reject ambiguous JSON rather than letting a repeated field replace a rule.

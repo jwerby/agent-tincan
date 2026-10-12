@@ -185,7 +185,7 @@ func (s *Store) MarkEmailResponseSent(ctx context.Context, messageID string) err
 // failed, declined, expired or cancelled) closed, zero when it has none.
 func (s *Store) LastAskClosed(ctx context.Context, agent string) (time.Time, error) {
 	var ms sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT MAX(updated_at) FROM requests WHERE to_agent = ? AND kind = ? AND status IN (?, ?, ?, ?, ?)`,
+	err := s.db.QueryRowContext(ctx, `SELECT MAX(updated_at) FROM requests WHERE to_agent = ? AND kind = ? AND gate_action = '' AND status IN (?, ?, ?, ?, ?)`,
 		agent, string(envelope.KindAsk), string(envelope.StatusAnswered), string(envelope.StatusFailed), string(envelope.StatusDeclined),
 		string(envelope.StatusExpired), string(envelope.StatusCancelled)).Scan(&ms)
 	if err != nil || !ms.Valid {

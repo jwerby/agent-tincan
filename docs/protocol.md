@@ -148,7 +148,11 @@ Files live in an `attachments` directory (0700, files 0600) beside the relay dat
 
 With an owner-configured `approval.json`, sends can enter non-terminal `held`.
 A gate key of `"*"` holds targets with no entry of their own. A named entry
-wins, and `"*"` does not turn off the council or dot-web defaults.
+wins, and `"*"` does not turn off the council or dot-web defaults. Replies,
+clarification questions, and clarification answers use the same gate. A held
+reply or answer is a separate request. Its response has `status: "held"` and
+the new request id. Approve applies it to the parent. Deny leaves the parent
+unchanged. Pings are not held.
 
 A held send response has an optional `status: "held"` field; ordinary send
 responses remain unchanged. Get-reply and trace report `held` in their existing

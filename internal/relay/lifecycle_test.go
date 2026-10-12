@@ -76,7 +76,11 @@ func TestCombinedRequestLifecycle(t *testing.T) {
 	if err != nil || res.Status != envelope.StatusNeedsInput || res.Reply == nil || res.Reply.Body != "Which restaurant?" {
 		t.Fatalf("needs_input = %+v, %v", res, err)
 	}
-	if _, err := asker.Answer(ctx, req.ID, "Nopa"); err != nil {
+	heldAnswer, err := asker.Answer(ctx, req.ID, "Nopa")
+	if err != nil || heldAnswer.Status != envelope.StatusHeld {
+		t.Fatalf("answer = %+v, %v", heldAnswer, err)
+	}
+	if err := admin.Raw(ctx, "POST", "/v1/admin/requests/"+heldAnswer.ID+"/approve", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	again := claim()
@@ -113,8 +117,14 @@ func TestCombinedRequestLifecycle(t *testing.T) {
 		if e.Request.To == "instinct" {
 			status, body = envelope.StatusNeedsInput, "red or white?"
 		}
-		if _, err := c.Reply(ctx, e.Request.ID, body, status); err != nil {
+		rep, err := c.Reply(ctx, e.Request.ID, body, status)
+		if err != nil {
 			t.Fatal(err)
+		}
+		if rep.Status == envelope.StatusHeld {
+			if err := admin.Raw(ctx, "POST", "/v1/admin/requests/"+rep.RequestID+"/approve", nil, nil); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	g, err = muse.GetGroup(ctx, g.Group, 0)

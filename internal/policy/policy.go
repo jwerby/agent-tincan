@@ -108,25 +108,39 @@ func (p *Policy) Prepare(ctx context.Context, req *envelope.Request) error {
 	if req.Kind == envelope.KindPing {
 		return nil
 	}
-	held, err := p.cfg.Approval.Held(req)
-	if held {
-		req.Status = envelope.StatusHeld
-		return nil
-	}
-	if err != nil {
+	if _, err := p.hold(ctx, req, parent, ok); err != nil {
 		p.Refund(*req)
 		return reject(http.StatusServiceUnavailable, err)
 	}
-	p.holdByKind(ctx, req, parent, ok)
 	return nil
 }
 
-// holdByDefault lists the target kinds whose asks and notifies wait for the
-// owner's approval even with no approval.json entry. A council sends the ask
-// on to every model vendor on the team. dot-web types each request into the
-// owner's dot DM as the owner, and a dot acts through the owner's connected
-// apps. Replies and answers never pass through Prepare, so replies to a
-// dot's own asks are not held.
+// HoldDelivery applies the approval gate to a reply or a clarification
+// answer. It does not rate-limit or extend a chain. Pings are not held.
+func (p *Policy) HoldDelivery(ctx context.Context, req *envelope.Request) (bool, error) {
+	held, err := p.hold(ctx, req, envelope.Request{}, false)
+	if err != nil {
+		return false, reject(http.StatusServiceUnavailable, err)
+	}
+	return held, nil
+}
+
+func (p *Policy) hold(ctx context.Context, req *envelope.Request, parent envelope.Request, hasParent bool) (bool, error) {
+	if req.Kind == envelope.KindPing {
+		return false, nil
+	}
+	held, err := p.cfg.Approval.Held(req)
+	if held {
+		req.Status = envelope.StatusHeld
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	p.holdByKind(ctx, req, parent, hasParent)
+	return req.Status == envelope.StatusHeld, nil
+}
+
 var holdByDefault = map[string]bool{onboard.KindCouncil: true, onboard.KindDotWeb: true}
 
 // holdByKind holds a request to an agent whose kind is in holdByDefault and
@@ -140,7 +154,7 @@ var holdByDefault = map[string]bool{onboard.KindCouncil: true, onboard.KindDotWe
 // skipped. The convening ask to the council has no such parent and stays
 // held.
 func (p *Policy) holdByKind(ctx context.Context, req *envelope.Request, parent envelope.Request, hasParent bool) {
-	entry, ttl, notify := p.cfg.Approval.holdDefaults(req.To)
+	entry, ttl, notify := p.cfg.Approval.exactGate(req.To)
 	if entry {
 		return
 	}
