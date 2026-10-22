@@ -952,12 +952,17 @@ func (s *Store) ClaimLeases(ctx context.Context, id, agent string, lease, urgent
 		return envelope.Request{}, ErrForbidden
 	}
 	now := s.now()
+	// A delivery hold keeps the parent from being claimed out from under the
+	// owner. An email reply does not pause the claim, so without this a
+	// claim taken after the hold would still be closed by the held text.
 	res, err := s.db.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = CASE WHEN kind = ? THEN 0 WHEN urgent = 1 THEN ? ELSE ? END,
 		claimed_at = CASE WHEN status = ? THEN claimed_at ELSE ? END, updated_at = ?
-		WHERE id = ? AND status IN (?, ?, ?) AND expires_at > ?`,
+		WHERE id = ? AND status IN (?, ?, ?) AND expires_at > ?
+		AND NOT `+openDeliveryHold,
 		string(envelope.StatusClaimed), string(envelope.KindNotify), now.Add(urgentLease).UnixMilli(), now.Add(lease).UnixMilli(),
 		string(envelope.StatusClaimed), now.UnixMilli(), now.UnixMilli(), id,
-		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed), now.UnixMilli())
+		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed), now.UnixMilli(),
+		string(envelope.StatusHeld), now.UnixMilli())
 	if err != nil {
 		return envelope.Request{}, err
 	}
@@ -982,9 +987,11 @@ func (s *Store) SetProgressLeases(ctx context.Context, id, claimer, note string,
 	now := s.now()
 	res, err := s.db.ExecContext(ctx, `UPDATE requests SET progress_note = ?, progress_at = ?, updated_at = ?,
 		lease_until = CASE WHEN kind = ? THEN 0 WHEN urgent = 1 THEN ? ELSE ? END
-		WHERE id = ? AND to_agent = ? AND status = ? AND (lease_until = 0 OR lease_until > ?)`,
+		WHERE id = ? AND to_agent = ? AND status = ? AND (lease_until = 0 OR lease_until > ?)
+		AND NOT `+openDeliveryHold,
 		note, now.UnixMilli(), now.UnixMilli(), string(envelope.KindNotify), now.Add(urgentLease).UnixMilli(), now.Add(lease).UnixMilli(),
-		id, claimer, string(envelope.StatusClaimed), now.UnixMilli())
+		id, claimer, string(envelope.StatusClaimed), now.UnixMilli(),
+		string(envelope.StatusHeld), now.UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -1086,6 +1093,9 @@ func (s *Store) Get(ctx context.Context, id, agent string) (Result, error) {
 		if note, err = s.RelayNote(ctx, id); err != nil {
 			return Result{}, err
 		}
+	}
+	if err := s.hideHeldProgress(ctx, &req); err != nil {
+		return Result{}, err
 	}
 	req.RedactFor(agent)
 	return Result{Request: req, Status: status, Reply: rep, Progress: req.Progress, Exchanges: req.Exchanges, RelayNote: note}, nil

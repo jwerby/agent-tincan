@@ -14,6 +14,7 @@ type deliveryAction struct {
 	Op       string          `json:"op"`
 	Status   envelope.Status `json:"status,omitempty"`
 	ParentID string          `json:"parent_id"`
+	Email    bool            `json:"email,omitempty"`
 }
 
 func (s *Server) holdReply(ctx context.Context, id, agent string, rep envelope.Reply, emailMessageID string, round int) (envelope.Reply, bool, error) {
@@ -86,6 +87,7 @@ func (s *Server) holdAnswer(ctx context.Context, id, agent, body string) (envelo
 }
 
 func (s *Server) enqueueHold(ctx context.Context, shadow envelope.Request, action deliveryAction, agent, emailMessageID, emailRequestID string) (envelope.Reply, bool, error) {
+	action.Email = emailMessageID != ""
 	raw, err := json.Marshal(action)
 	if err != nil {
 		return envelope.Reply{}, true, err

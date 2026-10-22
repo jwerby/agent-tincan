@@ -1418,3 +1418,45 @@ func TestAgentsListShowsNodeToAdminOnly(t *testing.T) {
 		t.Errorf("old client decoded %d agents, want %d", len(old.Agents), len(admin.Agents))
 	}
 }
+
+// Approve does not apply a held delivery when the expiry sweep fails. The
+// shadow stays held and the parent is unchanged.
+func TestApproveSkipsDeliveryWhenSweepFails(t *testing.T) {
+	h := newHarness(t, Config{})
+	ctx := context.Background()
+	parent, err := h.st.Enqueue(ctx, envelope.Request{From: "grokbot", To: "muse", Kind: envelope.KindAsk, Body: "book a table", Hop: 1, Chain: []string{"grokbot"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.st.Claim(ctx, parent.ID, "muse", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := h.st.EnqueueDeliveryHold(ctx, envelope.Request{
+		From: "muse", To: "grokbot", ParentID: parent.ID, Kind: envelope.KindAsk, Body: "booked",
+		Status: envelope.StatusHeld, HoldTTL: time.Hour, Chain: []string{"grokbot", "muse"},
+	}, `{"op":"reply","status":"answered","parent_id":"`+parent.ID+`"}`, "reply", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/requests/"+shadow.ID+"/approve", nil)
+	req.RemoteAddr = macAddr
+	req = req.WithContext(gone)
+	rec := httptest.NewRecorder()
+	h.h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("approve = %d %s, want 500", rec.Code, rec.Body)
+	}
+	got, status, err := h.st.Request(ctx, parent.ID)
+	if err != nil || status != envelope.StatusClaimed || got.Body != "book a table" {
+		t.Fatalf("parent = %+v %s %v, want it unchanged", got, status, err)
+	}
+	if result, err := h.st.Get(ctx, parent.ID, "grokbot"); err != nil || result.Reply != nil {
+		t.Fatalf("reply = %+v %v, want none", result.Reply, err)
+	}
+	_, shadowStatus, err := h.st.Request(ctx, shadow.ID)
+	if err != nil || shadowStatus != envelope.StatusHeld {
+		t.Fatalf("shadow = %s %v, want held", shadowStatus, err)
+	}
+}

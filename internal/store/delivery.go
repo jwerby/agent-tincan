@@ -48,6 +48,14 @@ func (s *Store) EnqueueDeliveryHold(ctx context.Context, req envelope.Request, a
 	if _, err := tx.ExecContext(ctx, `UPDATE requests SET gate_action = ? WHERE id = ?`, action, req.ID); err != nil {
 		return envelope.Request{}, err
 	}
+	// A progress note is the claimer's text. The hold exists to keep that
+	// delivery off the asker, a council, and approval.json, so the note goes
+	// with it until the hold is gone.
+	if req.ParentID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE requests SET progress_note = '', progress_at = 0 WHERE id = ?`, req.ParentID); err != nil {
+			return envelope.Request{}, err
+		}
+	}
 	if pauseParentLease {
 		res, err := tx.ExecContext(ctx, `UPDATE requests SET lease_paused = 1, updated_at = ? WHERE id = ? AND status = ?`,
 			now, req.ParentID, string(envelope.StatusClaimed))
@@ -101,6 +109,7 @@ func (s *Store) ApplyHeldDelivery(ctx context.Context, id string) (HeldDelivery,
 			Op       string `json:"op"`
 			Status   string `json:"status"`
 			ParentID string `json:"parent_id"`
+			Email    bool   `json:"email"`
 		}
 		if json.Unmarshal([]byte(raw), &act) != nil || act.ParentID == "" || act.ParentID != shadow.ParentID {
 			return ErrWrongState
@@ -114,7 +123,11 @@ func (s *Store) ApplyHeldDelivery(ctx context.Context, id string) (HeldDelivery,
 			if rep.Status == envelope.StatusNeedsInput {
 				rep, err = s.needsInputTx(ctx, tx, shadow.ParentID, shadow.From, rep)
 			} else {
-				rep, err = s.replyTx(ctx, tx, shadow.ParentID, shadow.From, rep, false)
+				// An email reply was gated when it was held. Apply it with
+				// the same guard, in this transaction: a live claim or an
+				// unapproved hold rolls the unbind and the parent write back
+				// and leaves the shadow held.
+				rep, err = s.replyTx(ctx, tx, shadow.ParentID, shadow.From, rep, act.Email)
 			}
 			if err != nil {
 				return err
@@ -147,7 +160,7 @@ func (s *Store) commitHeldDelivery(ctx context.Context, shadowID string, apply f
 		return err
 	}
 	defer tx.Rollback()
-	if err := requireHeldTx(ctx, tx, shadowID); err != nil {
+	if err := requireHeldTx(ctx, tx, shadowID, s.now().UnixMilli()); err != nil {
 		return err
 	}
 	if err := unbindAttachmentsTx(ctx, tx, shadowID); err != nil {
@@ -162,19 +175,79 @@ func (s *Store) commitHeldDelivery(ctx context.Context, shadowID string, apply f
 	return tx.Commit()
 }
 
-func requireHeldTx(ctx context.Context, tx *sql.Tx, id string) error {
+func requireHeldTx(ctx context.Context, tx *sql.Tx, id string, now int64) error {
 	var status string
-	err := tx.QueryRowContext(ctx, `SELECT status FROM requests WHERE id = ?`, id).Scan(&status)
+	var expires int64
+	err := tx.QueryRowContext(ctx, `SELECT status, expires_at FROM requests WHERE id = ?`, id).Scan(&status, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
-	if status != string(envelope.StatusHeld) {
+	// Release refuses an overdue hold. Applying one after a missed sweep
+	// would deliver text the owner can no longer approve.
+	if status != string(envelope.StatusHeld) || expires <= now {
 		return ErrWrongState
 	}
 	return nil
+}
+
+// openDeliveryHold matches an unexpired held child of the outer requests row:
+// a reply or answer shadow still waiting on the owner.
+const openDeliveryHold = `EXISTS (SELECT 1 FROM requests AS held WHERE held.parent_id = requests.id AND held.status = ? AND held.expires_at > ?)`
+
+type adminProgressKey struct{}
+
+// WithAdminProgress marks ctx as an admin read. Get and Trace keep a
+// progress note for that caller while a delivery hold is open; every other
+// caller has the note omitted until the hold is gone.
+func WithAdminProgress(ctx context.Context) context.Context {
+	return context.WithValue(ctx, adminProgressKey{}, true)
+}
+
+func adminProgress(ctx context.Context) bool {
+	v, _ := ctx.Value(adminProgressKey{}).(bool)
+	return v
+}
+
+// hideHeldProgress drops a progress note while parent req has an unexpired
+// delivery hold, except on an admin read.
+func (s *Store) hideHeldProgress(ctx context.Context, req *envelope.Request) error {
+	if req.Progress == nil || adminProgress(ctx) {
+		return nil
+	}
+	open, err := s.OpenDeliveryHold(ctx, req.ID)
+	if err != nil || !open {
+		return err
+	}
+	req.Progress = nil
+	return nil
+}
+
+// OverlayProgress writes the progress columns of id without the hold check
+// SetProgressLeases enforces. Tests use it to leave a note in place while a
+// delivery hold is open.
+func (s *Store) OverlayProgress(ctx context.Context, id, note string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE requests SET progress_note = ?, progress_at = ? WHERE id = ?`, note, s.now().UnixMilli(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// OpenDeliveryHold reports whether parentID has an unexpired delivery hold.
+func (s *Store) OpenDeliveryHold(ctx context.Context, parentID string) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM requests WHERE parent_id = ? AND status = ? AND expires_at > ? LIMIT 1`,
+		parentID, string(envelope.StatusHeld), s.now().UnixMilli()).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func unbindAttachmentsTx(ctx context.Context, tx *sql.Tx, requestID string) error {
@@ -223,8 +296,8 @@ func resumeClaimIfIdle(ctx context.Context, ex sqlExecer, parentID string, now i
 }
 
 func finishHeldTx(ctx context.Context, tx *sql.Tx, id string, now int64) error {
-	res, err := tx.ExecContext(ctx, `UPDATE requests SET status = ?, approved = 1, body = '', updated_at = ? WHERE id = ? AND status = ?`,
-		deliveryApplied, now, id, string(envelope.StatusHeld))
+	res, err := tx.ExecContext(ctx, `UPDATE requests SET status = ?, approved = 1, body = '', updated_at = ? WHERE id = ? AND status = ? AND expires_at > ?`,
+		deliveryApplied, now, id, string(envelope.StatusHeld), now)
 	if err != nil {
 		return err
 	}

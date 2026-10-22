@@ -209,6 +209,9 @@ func (s *Store) Trace(ctx context.Context, traceID string) ([]TraceStep, error) 
 		if err != nil {
 			return nil, err
 		}
+		if err := s.hideHeldProgress(ctx, &req); err != nil {
+			return nil, err
+		}
 		out = append(out, TraceStep{Request: req, Status: st, Reply: rep, Progress: req.Progress, Exchanges: req.Exchanges})
 	}
 	return out, nil

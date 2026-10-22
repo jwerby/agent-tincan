@@ -454,13 +454,15 @@ func (s *Server) pollEmailRepliesEvery(ctx context.Context) {
 	}
 }
 
-// Sweep runs one expiry and lease pass and wakes affected waiters.
-func (s *Server) Sweep(ctx context.Context) {
+// Sweep runs one expiry and lease pass and wakes affected waiters. An error
+// from the store pass is returned after it is logged so a caller that is
+// about to approve a hold can stop instead of applying an overdue one.
+func (s *Server) Sweep(ctx context.Context) error {
 	s.notifyWebStatus(ctx)
 	trs, err := s.store.Sweep(ctx)
 	if err != nil {
 		log.Printf("sweep: %v", err)
-		return
+		return err
 	}
 	for _, t := range trs {
 		event := "requeued"
@@ -485,6 +487,7 @@ func (s *Server) Sweep(ctx context.Context) {
 			}
 		}
 	}
+	return nil
 }
 
 func isLocalAdmin(ctx context.Context) bool {
@@ -1128,9 +1131,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	wait := durationParam(r, "wait", 0, s.cfg.MaxWait)
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
+	ctx := s.readCtx(r)
 	for {
 		wake := s.hub.wait(requestKey(id))
-		res, err := s.store.Get(r.Context(), id, name)
+		res, err := s.store.Get(ctx, id, name)
 		if err != nil {
 			writeErr(w, statusFor(err), err)
 			return
@@ -1147,7 +1151,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
-		res, err = s.store.Get(r.Context(), id, name)
+		res, err = s.store.Get(ctx, id, name)
 		if err != nil {
 			writeErr(w, statusFor(err), err)
 			return
@@ -1761,9 +1765,18 @@ func (s *Server) isAdmin(r *http.Request) bool {
 	return s.dir.IsAdmin(r.Context(), s.remote(r))
 }
 
+// readCtx is the caller's context, marked so an admin still receives a
+// progress note while a delivery hold is open. Other callers do not.
+func (s *Server) readCtx(r *http.Request) context.Context {
+	if s.isAdmin(r) {
+		return store.WithAdminProgress(r.Context())
+	}
+	return r.Context()
+}
+
 func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 	trace := r.PathValue("trace")
-	steps, err := s.store.Trace(r.Context(), trace)
+	steps, err := s.store.Trace(s.readCtx(r), trace)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -1910,7 +1923,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
 		return
 	}
-	s.Sweep(r.Context())
+	// Sweep expires an overdue hold before it can be approved. If that pass
+	// fails, the shadow is still held and must not be applied.
+	if err := s.Sweep(r.Context()); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	id := r.PathValue("id")
 	action, err := s.store.GateAction(r.Context(), id)
 	if err != nil {

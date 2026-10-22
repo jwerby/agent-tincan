@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 	"github.com/mvanhorn/agent-tincan/internal/policy"
 	"github.com/mvanhorn/agent-tincan/internal/relay"
@@ -403,6 +404,13 @@ func TestGatedEmailReplyStaysOpenUntilApproved(t *testing.T) {
 	}
 	if shadow == "" {
 		t.Fatal("no held shadow for the email reply")
+	}
+	action, err := e.m.Store.GateAction(t.Context(), shadow)
+	if err != nil || !strings.Contains(action, `"email":true`) {
+		t.Fatalf("gate action = %q %v, want the email flag", action, err)
+	}
+	if _, err := e.m.Client(t, "instinct").Claim(t.Context(), req.ID); err == nil || !client.IsStatus(err, 409) {
+		t.Fatalf("claim while the email is held = %v, want 409", err)
 	}
 	if err := e.m.Client(t, "admin").Raw(t.Context(), "POST", "/v1/admin/requests/"+shadow+"/approve", nil, nil); err != nil {
 		t.Fatal(err)

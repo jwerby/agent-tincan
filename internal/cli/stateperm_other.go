@@ -1,19 +1,14 @@
-//go:build !unix
+//go:build !unix && !windows
 
 package cli
 
 import (
+	"errors"
 	"fmt"
-	"os"
 )
 
-func chmodNoFollow(path string, mode os.FileMode) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%s is a symlink", path)
-	}
-	return os.Chmod(path, mode)
+// chmodTree refuses to start. These platforms have no O_NOFOLLOW open, and a
+// path chmod would follow a symlink swapped in between the check and the change.
+func chmodTree(root string) error {
+	return fmt.Errorf("secure state dir %s: %w", root, errors.ErrUnsupported)
 }

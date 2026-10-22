@@ -2,14 +2,14 @@ package cli
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
-	"path/filepath"
 )
 
 // secureStateDir tightens the state directory and its contents. The directory
-// itself must not be a symlink. Modes are changed without following links, so
-// a link inside the tree cannot point the change at a file outside it.
+// itself must not be a symlink. Modes are changed on file descriptors opened
+// without following links: openat from the parent directory on unix, and
+// O_NOFOLLOW (or a refusal to start) elsewhere. A link inside the tree cannot
+// point the change at a file outside it.
 func secureStateDir(root string) error {
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -21,17 +21,5 @@ func secureStateDir(root string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("state dir %s is not a directory", root)
 	}
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		mode := os.FileMode(0o600)
-		if d.IsDir() {
-			mode = 0o700
-		}
-		return chmodNoFollow(path, mode)
-	})
+	return chmodTree(root)
 }

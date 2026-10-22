@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -305,5 +306,77 @@ func TestApproveClarificationAfterLease(t *testing.T) {
 	got, err = muse.Get(ctx, req.ID, 0)
 	if err != nil || got.Status != envelope.StatusNeedsInput || got.Reply == nil || got.Reply.Body != "Which night?" {
 		t.Fatalf("approved clarification = %+v %v", got, err)
+	}
+}
+
+// While a delivery hold is open, a progress note is rejected, cleared, and
+// left off get and trace for everyone except an admin.
+func TestProgressHiddenWhileDeliveryHeld(t *testing.T) {
+	m := testrelay.New(t, relay.Config{})
+	path := filepath.Join(t.TempDir(), "approval.json")
+	if err := os.WriteFile(path, []byte(`{"gate":{"muse":{"from":"*"}},"hold_ttl":"1h"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := policy.LoadApproval(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Server.SetPreparer(policy.New(m.Store, policy.Config{Approval: a}))
+	ctx := t.Context()
+	muse, grok, admin := m.Client(t, "muse"), m.Client(t, "grokbot"), m.Client(t, "admin")
+	req, err := muse.Send(ctx, "grokbot", "book a table", envelope.KindAsk, "", false)
+	if err != nil || req.Status == envelope.StatusHeld {
+		t.Fatalf("send = %+v %v", req, err)
+	}
+	if _, err := grok.Claim(ctx, req.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := grok.Progress(ctx, req.ID, "calling the restaurant"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := muse.Get(ctx, req.ID, 0)
+	if err != nil || got.Progress == nil || !strings.Contains(client.FormatResult(got), "calling the restaurant") {
+		t.Fatalf("before the hold = %+v %v", got.Progress, err)
+	}
+	rep, err := grok.Reply(ctx, req.ID, "booked", envelope.StatusAnswered)
+	if err != nil || rep.Status != envelope.StatusHeld {
+		t.Fatalf("reply = %+v %v, want held", rep, err)
+	}
+	got, err = muse.Get(ctx, req.ID, 0)
+	if err != nil || got.Progress != nil || strings.Contains(client.FormatResult(got), "calling the restaurant") {
+		t.Fatalf("get after the hold = %+v %q %v", got.Progress, client.FormatResult(got), err)
+	}
+	if err := grok.Progress(ctx, req.ID, "still calling"); err == nil || !client.IsStatus(err, 409) {
+		t.Fatalf("progress during hold = %v, want 409", err)
+	}
+	if _, err := grok.Claim(ctx, req.ID); err == nil || !client.IsStatus(err, 409) {
+		t.Fatalf("claim during hold = %v, want 409", err)
+	}
+	if err := m.Store.OverlayProgress(ctx, req.ID, "secret note"); err != nil {
+		t.Fatal(err)
+	}
+	for _, who := range []string{"muse", "grokbot"} {
+		res, err := m.Client(t, who).Get(ctx, req.ID, 0)
+		if err != nil || res.Progress != nil || strings.Contains(client.FormatResult(res), "secret note") {
+			t.Fatalf("%s get = %+v %q %v, want the note omitted", who, res.Progress, client.FormatResult(res), err)
+		}
+		var trace struct {
+			Steps []envelope.Result `json:"steps"`
+		}
+		if err := m.Client(t, who).Raw(ctx, "GET", "/v1/trace/"+req.TraceID, nil, &trace); err != nil {
+			t.Fatal(err)
+		}
+		if len(trace.Steps) != 1 || trace.Steps[0].Progress != nil {
+			t.Fatalf("%s trace = %+v, want the note omitted", who, trace.Steps)
+		}
+	}
+	var adminTrace struct {
+		Steps []envelope.Result `json:"steps"`
+	}
+	if err := admin.Raw(ctx, "GET", "/v1/trace/"+req.TraceID, nil, &adminTrace); err != nil {
+		t.Fatal(err)
+	}
+	if len(adminTrace.Steps) != 1 || adminTrace.Steps[0].Progress == nil || adminTrace.Steps[0].Progress.Note != "secret note" {
+		t.Fatalf("admin trace = %+v, want the note", adminTrace.Steps)
 	}
 }
