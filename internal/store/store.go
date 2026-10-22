@@ -1028,7 +1028,7 @@ func (s *Store) Reply(ctx context.Context, id, agent string, rep envelope.Reply)
 // when the request is no longer open or fails those conditions.
 func (s *Store) replyTx(ctx context.Context, tx *sql.Tx, id, agent string, rep envelope.Reply, byEmail bool) (envelope.Reply, error) {
 	now := s.now()
-	args := []any{string(rep.Status), now.UnixMilli(), now.UnixMilli(), id,
+	args := []any{string(rep.Status), now.UnixMilli(), now.UnixMilli(), id, agent,
 		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed)}
 	where := ""
 	if byEmail {
@@ -1036,7 +1036,7 @@ func (s *Store) replyTx(ctx context.Context, tx *sql.Tx, id, agent string, rep e
 		args = append(args, now.UnixMilli())
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = 0, updated_at = ?, reply_seen_at = CASE WHEN kind = 'ping' THEN ? ELSE 0 END, reply_generation = reply_generation + 1
-		WHERE id = ? AND status IN (?, ?, ?)`+where, args...)
+		WHERE id = ? AND to_agent = ? AND status IN (?, ?, ?)`+where, args...)
 	if err != nil {
 		return envelope.Reply{}, err
 	}
@@ -1219,6 +1219,11 @@ func (s *Store) Sweep(ctx context.Context) ([]Transition, error) {
 		string(envelope.StatusExpired), now, string(envelope.StatusClaimed), now, now); err != nil {
 		return nil, err
 	}
+	// A held clarification pauses its parent's claim. Once that hold is gone,
+	// the claim runs again and a lease that already elapsed is requeued below.
+	if err := s.resumeIdleClaims(ctx, now); err != nil {
+		return nil, err
+	}
 	for _, prev := range []envelope.Status{envelope.StatusDelivered, envelope.StatusClaimed} {
 		if err := collect(prev, `UPDATE requests SET status = ?, lease_until = 0, updated_at = ?, progress_note = '', progress_at = 0
 		WHERE status = ? AND lease_paused = 0 AND lease_until > 0 AND lease_until <= ?`,
@@ -1354,6 +1359,13 @@ func (s *Store) DenyHeld(ctx context.Context, id, reason string) (envelope.Reque
 		return envelope.Request{}, err
 	}
 	defer tx.Rollback()
+	var parentID, action string
+	if err := tx.QueryRowContext(ctx, `SELECT parent_id, gate_action FROM requests WHERE id = ?`, id).Scan(&parentID, &action); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return envelope.Request{}, ErrWrongState
+		}
+		return envelope.Request{}, err
+	}
 	now := s.now().UnixMilli()
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status = ?, updated_at = ? WHERE id = ? AND status = ? AND expires_at > ?`, string(envelope.StatusDeclined), now, id, string(envelope.StatusHeld), now)
 	if err != nil {
@@ -1364,6 +1376,11 @@ func (s *Store) DenyHeld(ctx context.Context, id, reason string) (envelope.Reque
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO replies (request_id,from_agent,status,body,created_at) VALUES (?,?,?,?,?)`, id, "relay", string(envelope.StatusDeclined), reason, now); err != nil {
 		return envelope.Request{}, err
+	}
+	if clarificationHold(action) && parentID != "" {
+		if err := resumeClaimIfIdle(ctx, tx, parentID, now); err != nil {
+			return envelope.Request{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return envelope.Request{}, err

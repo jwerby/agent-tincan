@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 	"github.com/mvanhorn/agent-tincan/internal/store"
@@ -27,14 +28,17 @@ func (s *Server) holdReply(ctx context.Context, id, agent string, rep envelope.R
 	if !ok {
 		return envelope.Reply{}, false, nil
 	}
-	msg := &envelope.Request{From: agent, To: parent.From, Kind: parent.Kind, Body: rep.Body, Chain: []string{agent}}
+	// The gate sees the whole chain, not only the replier: a name earlier in
+	// the parent is enough to hold the reply.
+	chain := append(slices.Clone(parent.Chain), agent)
+	msg := &envelope.Request{From: agent, To: parent.From, Kind: parent.Kind, Body: rep.Body, Chain: chain}
 	held, err := gater.HoldDelivery(ctx, msg)
 	if err != nil || !held {
 		return envelope.Reply{}, err != nil, err
 	}
 	shadow := envelope.Request{
 		From: agent, To: parent.From, ParentID: parent.ID, TraceID: parent.TraceID,
-		Hop: parent.Hop + 1, Chain: []string{agent}, Kind: parent.Kind, Body: rep.Body,
+		Hop: parent.Hop + 1, Chain: chain, Kind: parent.Kind, Body: rep.Body,
 		Status: envelope.StatusHeld, HoldTTL: msg.HoldTTL, ApprovalNotify: msg.ApprovalNotify,
 	}
 	if shadow.Hop < 1 {
@@ -58,14 +62,15 @@ func (s *Server) holdAnswer(ctx context.Context, id, agent, body string) (envelo
 	if !ok {
 		return envelope.Request{}, false, nil
 	}
-	msg := &envelope.Request{From: agent, To: parent.To, Kind: parent.Kind, Body: body, Chain: []string{agent}}
+	chain := append(slices.Clone(parent.Chain), agent)
+	msg := &envelope.Request{From: agent, To: parent.To, Kind: parent.Kind, Body: body, Chain: chain}
 	held, err := gater.HoldDelivery(ctx, msg)
 	if err != nil || !held {
 		return envelope.Request{}, err != nil, err
 	}
 	shadow := envelope.Request{
 		From: agent, To: parent.To, ParentID: parent.ID, TraceID: parent.TraceID,
-		Hop: parent.Hop + 1, Chain: []string{agent}, Kind: parent.Kind, Body: body,
+		Hop: parent.Hop + 1, Chain: chain, Kind: parent.Kind, Body: body,
 		Status: envelope.StatusHeld, HoldTTL: msg.HoldTTL, ApprovalNotify: msg.ApprovalNotify,
 	}
 	if shadow.Hop < 1 {
@@ -85,7 +90,8 @@ func (s *Server) enqueueHold(ctx context.Context, shadow envelope.Request, actio
 	if err != nil {
 		return envelope.Reply{}, true, err
 	}
-	shadow, err = s.store.EnqueueDeliveryHold(ctx, shadow, string(raw), action.Op)
+	pauseLease := action.Op == "reply" && action.Status == envelope.StatusNeedsInput
+	shadow, err = s.store.EnqueueDeliveryHold(ctx, shadow, string(raw), action.Op, pauseLease)
 	if err != nil {
 		return envelope.Reply{}, true, err
 	}
@@ -181,46 +187,27 @@ func (s *Server) approveDelivery(w http.ResponseWriter, r *http.Request, id, act
 		writeErr(w, http.StatusConflict, store.ErrWrongState)
 		return
 	}
-	shadow, status, err := s.store.Request(r.Context(), id)
+	// Unbind, the parent write, and marking the shadow applied commit together.
+	// A failure in the parent write leaves the parent unchanged and the shadow held.
+	applied, err := s.store.ApplyHeldDelivery(r.Context(), id)
 	if err != nil {
 		writeErr(w, statusFor(err), err)
 		return
 	}
-	if status != envelope.StatusHeld {
-		writeErr(w, http.StatusConflict, store.ErrWrongState)
-		return
-	}
-	if err := s.store.UnbindAttachments(r.Context(), id); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	switch act.Op {
+	switch applied.Op {
 	case "reply":
-		rep := envelope.Reply{Body: shadow.Body, Status: act.Status, Attachments: shadow.Attachments}
-		if _, err := s.recordReply(r.Context(), shadow.ParentID, shadow.From, rep, "", 0, true); err != nil {
-			writeErr(w, statusFor(err), err)
-			return
-		}
+		s.announceReply(r.Context(), applied.Shadow.ParentID, applied.Shadow.From, applied.Reply, false)
 	case "answer":
-		req, err := s.store.Answer(r.Context(), shadow.ParentID, shadow.From, shadow.Body)
-		if err != nil {
-			writeErr(w, statusFor(err), err)
-			return
-		}
-		s.publishAnswer(r.Context(), req, shadow.From, shadow.Body)
+		s.publishAnswer(r.Context(), applied.Parent, applied.Shadow.From, applied.Shadow.Body)
 	default:
 		writeErr(w, http.StatusConflict, store.ErrWrongState)
 		return
 	}
-	if err := s.store.FinishHeldDelivery(r.Context(), id); err != nil {
-		writeErr(w, statusFor(err), err)
-		return
-	}
-	s.record(r.Context(), "approved", id, shadow.TraceID, s.remote(r), store.DetailJSON(map[string]any{"op": act.Op, "parent_id": shadow.ParentID}))
-	shadow.Status = envelope.StatusAnswered
-	shadow.Body = ""
-	shadow.Approved = true
-	writeJSON(w, http.StatusOK, shadow)
+	s.record(r.Context(), "approved", id, applied.Shadow.TraceID, s.remote(r), store.DetailJSON(map[string]any{"op": applied.Op, "parent_id": applied.Shadow.ParentID}))
+	applied.Shadow.Status = envelope.StatusAnswered
+	applied.Shadow.Body = ""
+	applied.Shadow.Approved = true
+	writeJSON(w, http.StatusOK, applied.Shadow)
 }
 
 func (s *Server) publishAnswer(ctx context.Context, req envelope.Request, actor, body string) {

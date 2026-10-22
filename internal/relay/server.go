@@ -1089,6 +1089,13 @@ func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope
 	if err != nil {
 		return envelope.Reply{}, err
 	}
+	s.announceReply(ctx, id, agent, rep, emailMessageID != "")
+	return rep, nil
+}
+
+// announceReply tells waiters, the audit log, and the asker's reply wake
+// that a reply is now on the parent. email marks an email reply in the audit.
+func (s *Server) announceReply(ctx context.Context, id, agent string, rep envelope.Reply, email bool) {
 	s.hub.notify(requestKey(id))
 	event := "replied"
 	detail := map[string]any{"status": rep.Status}
@@ -1096,7 +1103,7 @@ func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope
 		event = "needs_input"
 		detail = map[string]any{"question_bytes": len(rep.Body)}
 	}
-	if emailMessageID != "" {
+	if email {
 		detail["via"] = "email"
 	}
 	s.record(ctx, event, id, "", agent, store.DetailJSON(detail))
@@ -1110,7 +1117,6 @@ func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope
 	} else {
 		log.Printf("reply %s: look up asker: %v", id, err)
 	}
-	return rep, nil
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {

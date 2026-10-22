@@ -116,7 +116,9 @@ func (p *Policy) Prepare(ctx context.Context, req *envelope.Request) error {
 }
 
 // HoldDelivery applies the approval gate to a reply or a clarification
-// answer. It does not rate-limit or extend a chain. Pings are not held.
+// answer, whatever its kind. It does not rate-limit or extend a chain.
+// Prepare still does not hold a ping request; a reply to one is gated
+// like any other reply, including a full reply to a council ping.
 func (p *Policy) HoldDelivery(ctx context.Context, req *envelope.Request) (bool, error) {
 	held, err := p.hold(ctx, req, envelope.Request{}, false)
 	if err != nil {
@@ -126,9 +128,6 @@ func (p *Policy) HoldDelivery(ctx context.Context, req *envelope.Request) (bool,
 }
 
 func (p *Policy) hold(ctx context.Context, req *envelope.Request, parent envelope.Request, hasParent bool) (bool, error) {
-	if req.Kind == envelope.KindPing {
-		return false, nil
-	}
 	held, err := p.cfg.Approval.Held(req)
 	if held {
 		req.Status = envelope.StatusHeld
