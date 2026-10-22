@@ -1,26 +1,27 @@
 package cli
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 )
 
-// secureStateDir does not follow or chmod symlinks, so a link inside the
-// state directory cannot point the mode change at a file outside it.
+// secureStateDir tightens the state directory and its contents. The directory
+// itself must not be a symlink. Modes are changed without following links, so
+// a link inside the tree cannot point the change at a file outside it.
 func secureStateDir(root string) error {
 	info, err := os.Lstat(root)
 	if err != nil {
 		return err
 	}
-	walkRoot := root
 	if info.Mode()&os.ModeSymlink != 0 {
-		walkRoot, err = filepath.EvalSymlinks(root)
-		if err != nil {
-			return err
-		}
+		return fmt.Errorf("state dir %s is a symlink", root)
 	}
-	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
+	if !info.IsDir() {
+		return fmt.Errorf("state dir %s is not a directory", root)
+	}
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -31,6 +32,6 @@ func secureStateDir(root string) error {
 		if d.IsDir() {
 			mode = 0o700
 		}
-		return os.Chmod(path, mode)
+		return chmodNoFollow(path, mode)
 	})
 }

@@ -342,13 +342,38 @@ func defaultStateDir() string {
 	return ".tincan-relay"
 }
 
-var confirmTailnetPeer = func(addr string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if _, err := identity.NewLocalResolverAt("").WhoIs(ctx, addr); err != nil {
-		return false, err
+// listenOwner is what the local tailscaled reports for a candidate --listen
+// address: this node's id and Tailscale addresses, and the node WhoIs
+// attributes the address to.
+type listenOwner struct {
+	SelfID  string
+	SelfIPs []netip.Addr
+	WhoID   string
+}
+
+// lookupListenOwner asks the local daemon. A status or WhoIs failure is an
+// error, which --listen treats as a refusal.
+var lookupListenOwner = func(ctx context.Context, hostport string) (listenOwner, error) {
+	r := identity.NewLocalResolverAt("")
+	id, ips, err := r.Self(ctx)
+	if err != nil {
+		return listenOwner{}, err
 	}
-	return true, nil
+	who, err := r.WhoIs(ctx, hostport)
+	if err != nil {
+		return listenOwner{}, err
+	}
+	return listenOwner{SelfID: id, SelfIPs: ips, WhoID: who.ID}, nil
+}
+
+func containsAddr(ips []netip.Addr, ip netip.Addr) bool {
+	ip = ip.Unmap()
+	for _, have := range ips {
+		if have.Unmap() == ip {
+			return true
+		}
+	}
+	return false
 }
 
 func listenAddr(listen string, port int) (string, error) {
@@ -369,18 +394,14 @@ func listenAddr(listen string, port int) (string, error) {
 	if !ip.IsValid() || ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() {
 		return "", bad
 	}
-	inRange := false
-	for _, prefix := range tailnetPrefixes {
-		if prefix.Contains(ip) {
-			inRange = true
-			break
-		}
-	}
-	if !inRange {
-		ok, err := confirmTailnetPeer(net.JoinHostPort(ip.String(), strconv.Itoa(port)))
-		if err != nil || !ok {
-			return "", bad
-		}
+	// Only this node's own Tailscale addresses. A CGNAT or ULA address that
+	// the daemon does not attribute to self, a peer address WhoIs resolves,
+	// and any WhoIs or daemon failure are refusals.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	owner, err := lookupListenOwner(ctx, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	if err != nil || owner.WhoID == "" || owner.SelfID == "" || owner.WhoID != owner.SelfID || !containsAddr(owner.SelfIPs, ip) {
+		return "", bad
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 }

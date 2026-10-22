@@ -51,6 +51,26 @@ func TestSecureStateDirTightensFilesAndSkipsSymlinks(t *testing.T) {
 	checkMode(t, filepath.Join(linked, "keep"), 0o644)
 }
 
+func TestSecureStateDirRejectsSymlinkRoot(t *testing.T) {
+	target := t.TempDir()
+	if err := os.Chmod(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(target, "secret")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureStateDir(link); err == nil {
+		t.Fatal("symlink state dir was accepted")
+	}
+	checkMode(t, target, 0o755)
+	checkMode(t, secret, 0o644)
+}
+
 func checkMode(t *testing.T, path string, want os.FileMode) {
 	t.Helper()
 	info, err := os.Lstat(path)
