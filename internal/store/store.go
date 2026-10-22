@@ -31,6 +31,9 @@ var (
 	ErrGroupFull = errors.New("group already has 8 requests from this sender")
 	// ErrWrongState means the request is not in a state that allows this.
 	ErrWrongState = errors.New("request is not in a state that allows this")
+	// ErrPendingHold means a reply or clarification answer for this request
+	// is already waiting for the owner.
+	ErrPendingHold = errors.New("a delivery to this request is already held for approval")
 )
 
 const schema = `
@@ -175,7 +178,7 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate urgent: %w", err)
 	}
-	for _, col := range []struct{ name, definition string }{{"progress_note", "TEXT NOT NULL DEFAULT ''"}, {"progress_at", "INTEGER NOT NULL DEFAULT 0"}, {"claimed_at", "INTEGER NOT NULL DEFAULT 0"}} {
+	for _, col := range []struct{ name, definition string }{{"progress_note", "TEXT NOT NULL DEFAULT ''"}, {"progress_at", "INTEGER NOT NULL DEFAULT 0"}, {"claimed_at", "INTEGER NOT NULL DEFAULT 0"}, {"gate_action", "TEXT NOT NULL DEFAULT ''"}} {
 		var exists bool
 		if err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM pragma_table_info('requests') WHERE name = ?)", col.name).Scan(&exists); err != nil {
 			db.Close()
@@ -949,12 +952,17 @@ func (s *Store) ClaimLeases(ctx context.Context, id, agent string, lease, urgent
 		return envelope.Request{}, ErrForbidden
 	}
 	now := s.now()
+	// A delivery hold keeps the parent from being claimed out from under the
+	// owner. An email reply does not pause the claim, so without this a
+	// claim taken after the hold would still be closed by the held text.
 	res, err := s.db.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = CASE WHEN kind = ? THEN 0 WHEN urgent = 1 THEN ? ELSE ? END,
 		claimed_at = CASE WHEN status = ? THEN claimed_at ELSE ? END, updated_at = ?
-		WHERE id = ? AND status IN (?, ?, ?) AND expires_at > ?`,
+		WHERE id = ? AND status IN (?, ?, ?) AND expires_at > ?
+		AND NOT `+openDeliveryHold,
 		string(envelope.StatusClaimed), string(envelope.KindNotify), now.Add(urgentLease).UnixMilli(), now.Add(lease).UnixMilli(),
 		string(envelope.StatusClaimed), now.UnixMilli(), now.UnixMilli(), id,
-		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed), now.UnixMilli())
+		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed), now.UnixMilli(),
+		string(envelope.StatusHeld), now.UnixMilli())
 	if err != nil {
 		return envelope.Request{}, err
 	}
@@ -979,9 +987,11 @@ func (s *Store) SetProgressLeases(ctx context.Context, id, claimer, note string,
 	now := s.now()
 	res, err := s.db.ExecContext(ctx, `UPDATE requests SET progress_note = ?, progress_at = ?, updated_at = ?,
 		lease_until = CASE WHEN kind = ? THEN 0 WHEN urgent = 1 THEN ? ELSE ? END
-		WHERE id = ? AND to_agent = ? AND status = ? AND (lease_until = 0 OR lease_until > ?)`,
+		WHERE id = ? AND to_agent = ? AND status = ? AND (lease_until = 0 OR lease_until > ?)
+		AND NOT `+openDeliveryHold,
 		note, now.UnixMilli(), now.UnixMilli(), string(envelope.KindNotify), now.Add(urgentLease).UnixMilli(), now.Add(lease).UnixMilli(),
-		id, claimer, string(envelope.StatusClaimed), now.UnixMilli())
+		id, claimer, string(envelope.StatusClaimed), now.UnixMilli(),
+		string(envelope.StatusHeld), now.UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -1025,7 +1035,7 @@ func (s *Store) Reply(ctx context.Context, id, agent string, rep envelope.Reply)
 // when the request is no longer open or fails those conditions.
 func (s *Store) replyTx(ctx context.Context, tx *sql.Tx, id, agent string, rep envelope.Reply, byEmail bool) (envelope.Reply, error) {
 	now := s.now()
-	args := []any{string(rep.Status), now.UnixMilli(), now.UnixMilli(), id,
+	args := []any{string(rep.Status), now.UnixMilli(), now.UnixMilli(), id, agent,
 		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed)}
 	where := ""
 	if byEmail {
@@ -1033,7 +1043,7 @@ func (s *Store) replyTx(ctx context.Context, tx *sql.Tx, id, agent string, rep e
 		args = append(args, now.UnixMilli())
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = 0, updated_at = ?, reply_seen_at = CASE WHEN kind = 'ping' THEN ? ELSE 0 END, reply_generation = reply_generation + 1
-		WHERE id = ? AND status IN (?, ?, ?)`+where, args...)
+		WHERE id = ? AND to_agent = ? AND status IN (?, ?, ?)`+where, args...)
 	if err != nil {
 		return envelope.Reply{}, err
 	}
@@ -1083,6 +1093,9 @@ func (s *Store) Get(ctx context.Context, id, agent string) (Result, error) {
 		if note, err = s.RelayNote(ctx, id); err != nil {
 			return Result{}, err
 		}
+	}
+	if err := s.hideHeldProgress(ctx, &req); err != nil {
+		return Result{}, err
 	}
 	req.RedactFor(agent)
 	return Result{Request: req, Status: status, Reply: rep, Progress: req.Progress, Exchanges: req.Exchanges, RelayNote: note}, nil
@@ -1214,6 +1227,11 @@ func (s *Store) Sweep(ctx context.Context) ([]Transition, error) {
 	if err := collect(envelope.StatusClaimed, `UPDATE requests SET status = ?, lease_until = 0, updated_at = ?
 		WHERE status = ? AND lease_until > 0 AND lease_until <= ? AND expires_at <= ?`,
 		string(envelope.StatusExpired), now, string(envelope.StatusClaimed), now, now); err != nil {
+		return nil, err
+	}
+	// A held clarification pauses its parent's claim. Once that hold is gone,
+	// the claim runs again and a lease that already elapsed is requeued below.
+	if err := s.resumeIdleClaims(ctx, now); err != nil {
 		return nil, err
 	}
 	for _, prev := range []envelope.Status{envelope.StatusDelivered, envelope.StatusClaimed} {
@@ -1351,6 +1369,13 @@ func (s *Store) DenyHeld(ctx context.Context, id, reason string) (envelope.Reque
 		return envelope.Request{}, err
 	}
 	defer tx.Rollback()
+	var parentID, action string
+	if err := tx.QueryRowContext(ctx, `SELECT parent_id, gate_action FROM requests WHERE id = ?`, id).Scan(&parentID, &action); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return envelope.Request{}, ErrWrongState
+		}
+		return envelope.Request{}, err
+	}
 	now := s.now().UnixMilli()
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status = ?, updated_at = ? WHERE id = ? AND status = ? AND expires_at > ?`, string(envelope.StatusDeclined), now, id, string(envelope.StatusHeld), now)
 	if err != nil {
@@ -1361,6 +1386,11 @@ func (s *Store) DenyHeld(ctx context.Context, id, reason string) (envelope.Reque
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO replies (request_id,from_agent,status,body,created_at) VALUES (?,?,?,?,?)`, id, "relay", string(envelope.StatusDeclined), reason, now); err != nil {
 		return envelope.Request{}, err
+	}
+	if clarificationHold(action) && parentID != "" {
+		if err := resumeClaimIfIdle(ctx, tx, parentID, now); err != nil {
+			return envelope.Request{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return envelope.Request{}, err

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
+	"github.com/mvanhorn/agent-tincan/internal/policy"
 	"github.com/mvanhorn/agent-tincan/internal/relay"
 	"github.com/mvanhorn/agent-tincan/internal/testrelay"
 	"github.com/mvanhorn/agent-tincan/internal/wake"
@@ -349,6 +353,72 @@ func (e *emailEnv) decided(id string) bool {
 		e.t.Fatal(err)
 	}
 	return ok
+}
+
+// A gated email reply does not close the parent until the owner approves it.
+// A second message for the same request is held_pending, not recorded.
+func TestGatedEmailReplyStaysOpenUntilApproved(t *testing.T) {
+	e := newEmailEnv(t, relay.Config{})
+	path := filepath.Join(t.TempDir(), "approval.json")
+	if err := os.WriteFile(path, []byte(`{"gate":{"muse":{"from":"*"}},"hold_ttl":"1h"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := policy.LoadApproval(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.m.Server.SetPreparer(policy.New(e.m.Store, policy.Config{Approval: a}))
+	req := e.ask("find the generator quote")
+	e.mail.add(instinctMail, e.subject(req), new("The quote is $4,200."), time.Now())
+	e.poll()
+	res := e.get(req.ID)
+	if res.Status == envelope.StatusAnswered || res.Reply != nil {
+		t.Fatalf("parent closed before approval: %+v", res)
+	}
+	e.events.mu.Lock()
+	woke := len(e.events.replied)
+	e.events.mu.Unlock()
+	if woke != 0 {
+		t.Fatalf("held email reply woke the asker %d times", woke)
+	}
+	e.wantResponses("Agent Tincan: recorded. Your reply is held")
+
+	e.mail.add(instinctMail, e.subject(req), new("second try"), time.Now().Add(time.Second))
+	e.poll()
+	e.wantResponses(
+		"Agent Tincan: recorded. Your reply is held",
+		"Agent Tincan: not recorded: a reply to this request is already held",
+	)
+	if res = e.get(req.ID); res.Status == envelope.StatusAnswered || res.Reply != nil {
+		t.Fatalf("second email closed the parent: %+v", res)
+	}
+	held, err := e.m.Store.Held(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shadow string
+	for _, h := range held {
+		if h.ParentID == req.ID {
+			shadow = h.ID
+		}
+	}
+	if shadow == "" {
+		t.Fatal("no held shadow for the email reply")
+	}
+	action, err := e.m.Store.GateAction(t.Context(), shadow)
+	if err != nil || !strings.Contains(action, `"email":true`) {
+		t.Fatalf("gate action = %q %v, want the email flag", action, err)
+	}
+	if _, err := e.m.Client(t, "instinct").Claim(t.Context(), req.ID); err == nil || !client.IsStatus(err, 409) {
+		t.Fatalf("claim while the email is held = %v, want 409", err)
+	}
+	if err := e.m.Client(t, "admin").Raw(t.Context(), "POST", "/v1/admin/requests/"+shadow+"/approve", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	res = e.get(req.ID)
+	if res.Status != envelope.StatusAnswered || res.Reply == nil || !strings.Contains(res.Reply.Body, "$4,200") || strings.Contains(res.Reply.Body, "second try") {
+		t.Fatalf("approved email reply = %+v, want the first message only", res)
+	}
 }
 
 // AE2: a request already answered over tincan is left as it is, and the

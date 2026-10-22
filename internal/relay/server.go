@@ -124,6 +124,13 @@ type Preparer interface {
 	Prepare(ctx context.Context, req *envelope.Request) error
 }
 
+// DeliveryGater is an optional Preparer that also holds replies and
+// clarification answers. A preparer that does not implement it leaves those
+// paths ungated.
+type DeliveryGater interface {
+	HoldDelivery(ctx context.Context, req *envelope.Request) (bool, error)
+}
+
 // Refunder is an optional Preparer that gives back what Prepare took (the
 // urgent allowance) when the relay then fails to queue the request.
 type Refunder interface {
@@ -447,13 +454,15 @@ func (s *Server) pollEmailRepliesEvery(ctx context.Context) {
 	}
 }
 
-// Sweep runs one expiry and lease pass and wakes affected waiters.
-func (s *Server) Sweep(ctx context.Context) {
+// Sweep runs one expiry and lease pass and wakes affected waiters. An error
+// from the store pass is returned after it is logged so a caller that is
+// about to approve a hold can stop instead of applying an overdue one.
+func (s *Server) Sweep(ctx context.Context) error {
 	s.notifyWebStatus(ctx)
 	trs, err := s.store.Sweep(ctx)
 	if err != nil {
 		log.Printf("sweep: %v", err)
-		return
+		return err
 	}
 	for _, t := range trs {
 		event := "requeued"
@@ -478,6 +487,7 @@ func (s *Server) Sweep(ctx context.Context) {
 			}
 		}
 	}
+	return nil
 }
 
 func isLocalAdmin(ctx context.Context) bool {
@@ -1051,7 +1061,7 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errAttachmentsOff)
 		return
 	}
-	rep, err = s.recordReply(r.Context(), r.PathValue("id"), name, rep, "", 0)
+	rep, err = s.recordReply(r.Context(), r.PathValue("id"), name, rep, "", 0, false)
 	if err != nil {
 		writeErr(w, attachmentStatus(err, statusFor(err)), err)
 		return
@@ -1067,7 +1077,12 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 // An email reply is stored with its email_replies row in one transaction
 // (store.ReplyByEmail) and audited with via "email"; its tag, sender and
 // text never reach the audit log.
-func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope.Reply, emailMessageID string, round int) (envelope.Reply, error) {
+func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope.Reply, emailMessageID string, round int, skipGate bool) (envelope.Reply, error) {
+	if !skipGate {
+		if held, stop, err := s.holdReply(ctx, id, agent, rep, emailMessageID, round); stop || err != nil {
+			return held, err
+		}
+	}
 	var err error
 	if emailMessageID == "" {
 		rep, err = s.store.Reply(ctx, id, agent, rep)
@@ -1077,6 +1092,13 @@ func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope
 	if err != nil {
 		return envelope.Reply{}, err
 	}
+	s.announceReply(ctx, id, agent, rep, emailMessageID != "")
+	return rep, nil
+}
+
+// announceReply tells waiters, the audit log, and the asker's reply wake
+// that a reply is now on the parent. email marks an email reply in the audit.
+func (s *Server) announceReply(ctx context.Context, id, agent string, rep envelope.Reply, email bool) {
 	s.hub.notify(requestKey(id))
 	event := "replied"
 	detail := map[string]any{"status": rep.Status}
@@ -1084,7 +1106,7 @@ func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope
 		event = "needs_input"
 		detail = map[string]any{"question_bytes": len(rep.Body)}
 	}
-	if emailMessageID != "" {
+	if email {
 		detail["via"] = "email"
 	}
 	s.record(ctx, event, id, "", agent, store.DetailJSON(detail))
@@ -1098,7 +1120,6 @@ func (s *Server) recordReply(ctx context.Context, id, agent string, rep envelope
 	} else {
 		log.Printf("reply %s: look up asker: %v", id, err)
 	}
-	return rep, nil
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -1110,9 +1131,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	wait := durationParam(r, "wait", 0, s.cfg.MaxWait)
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
+	ctx := s.readCtx(r)
 	for {
 		wake := s.hub.wait(requestKey(id))
-		res, err := s.store.Get(r.Context(), id, name)
+		res, err := s.store.Get(ctx, id, name)
 		if err != nil {
 			writeErr(w, statusFor(err), err)
 			return
@@ -1129,7 +1151,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
-		res, err = s.store.Get(r.Context(), id, name)
+		res, err = s.store.Get(ctx, id, name)
 		if err != nil {
 			writeErr(w, statusFor(err), err)
 			return
@@ -1717,7 +1739,7 @@ func statusFor(err error) int {
 	case errors.Is(err, store.ErrForbidden), errors.Is(err, identity.ErrNotAdmin), errors.Is(err, identity.ErrNotJoined),
 		errors.Is(err, identity.ErrAgentAmbiguous):
 		return http.StatusForbidden
-	case errors.Is(err, store.ErrWrongState):
+	case errors.Is(err, store.ErrWrongState), errors.Is(err, store.ErrPendingHold):
 		return http.StatusConflict
 	case errors.Is(err, identity.ErrBadInvite):
 		return http.StatusBadRequest
@@ -1743,9 +1765,18 @@ func (s *Server) isAdmin(r *http.Request) bool {
 	return s.dir.IsAdmin(r.Context(), s.remote(r))
 }
 
+// readCtx is the caller's context, marked so an admin still receives a
+// progress note while a delivery hold is open. Other callers do not.
+func (s *Server) readCtx(r *http.Request) context.Context {
+	if s.isAdmin(r) {
+		return store.WithAdminProgress(r.Context())
+	}
+	return r.Context()
+}
+
 func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 	trace := r.PathValue("trace")
-	steps, err := s.store.Trace(r.Context(), trace)
+	steps, err := s.store.Trace(s.readCtx(r), trace)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -1892,8 +1923,22 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
 		return
 	}
-	s.Sweep(r.Context())
+	// Sweep expires an overdue hold before it can be approved. If that pass
+	// fails, the shadow is still held and must not be applied.
+	if err := s.Sweep(r.Context()); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	id := r.PathValue("id")
+	action, err := s.store.GateAction(r.Context(), id)
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	if action != "" {
+		s.approveDelivery(w, r, id, action)
+		return
+	}
 	ttl := s.cfg.RequestTTL
 	if held, _, err := s.store.Request(r.Context(), id); err == nil {
 		ttl = s.requestTTL(r.Context(), held.To)

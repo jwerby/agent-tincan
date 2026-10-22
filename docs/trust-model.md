@@ -9,7 +9,7 @@
 - Each sender is rate-limited (30 new requests per minute by default).
 - Every send, delivery, claim, reply, rejection, wake, join, rebind, and removal is written to an append-only, hash-chained log. `tincan audit-verify` detects edits.
 - Wake nudges carry only a count and an instruction, never request text, unless the owner sets `include_requests` for an email-woken agent (see Email replies below).
-- Clarification does not add a trust boundary: only a request's claimed target can ask for input, and only its original sender can answer. Questions and answers stay on the same request, with the same chain and hop rules. They are bodies like other messages: readable by the relay, absent from wake messages, and represented only by byte lengths in clarification audit details.
+- Clarification does not add a second trust boundary. Only a request's claimed target can ask for input, and only its original sender can answer. Questions, answers, and other replies go through the same owner approval gate as sends. They stay on the same request, with the same chain and hop rules. The relay can read them. Wake messages omit them. Clarification audit details record byte lengths only.
 - Search has the same visibility as trace: joined agents can search requests and replies only in chains they took part in; admins can search every chain. Visibility is unchanged. Search indexes existing stored bodies, not attachment contents, and results include only attachment names. A `search` audit event records the result count, never query text.
 
 ## Email replies
@@ -58,6 +58,9 @@ It does not encrypt messages or protect against access to both the database
 and key, a compromised relay host, or another process running as the relay
 user. Keep the state directory and its parents under the operator's control;
 this is not a hostile-filesystem sandbox or a power-loss durability guarantee.
+
+On startup the relay sets each directory in the state directory to 0700 and
+each other file to 0600. It does not change a symlink.
 
 ## Rebuilt machines
 
@@ -180,6 +183,23 @@ An `unless` list instead holds when any member is absent from the list. Exactly
 one of `from` and `unless` is required per target. Client-supplied identities,
 chains and statuses cannot bypass the check, which runs after the relay's
 cycle, hop and rate checks and before delivery. Both asks and notifies are gated.
+
+A gate key of `"*"` holds every target that has no entry of its own. It is an
+explicit opt-in, and it matches that one key only. `muse*`, `*muse`, and `**`
+are rejected. A named entry wins over `"*"`. `"*"` does not count as the named
+entry that turns off the council and dot-web defaults, so
+`{"gate":{"*":{"from":[]}}}` still holds those kinds. A named empty list still
+opens that one agent, as in `{"gate":{"council":{"from":[]}}}`.
+
+Replies, clarification questions, and clarification answers use this same gate.
+The recipient of a reply or a question is the original asker. The recipient of
+an answer is the original target. Pings are not held. When the gate holds one
+of these, the relay keeps the parent request as it was and stores a separate
+held request. `tincan held`, `tincan approve`, and `tincan deny` work on that
+request. Approve applies the reply, question, or answer to the parent. Deny
+leaves the parent unchanged. A second reply or answer while one is still held
+is rejected. The relay's own approval notices stay outside the gate so a notice
+cannot create another notice, and they still carry no request text.
 
 A missing file disables the gate for every target except agents of kind
 `council` and `dot-web`, which are held by default (see [Council](#council)). The relay reloads changed files. Unreadable,

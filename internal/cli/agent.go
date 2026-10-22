@@ -744,6 +744,10 @@ func replyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if rep.Status == envelope.StatusHeld {
+				cmd.Printf("Reply to %s is held for approval (%s).\n", args[0], rep.RequestID)
+				return nil
+			}
 			cmd.Printf("Replied to %s (%s).\n", args[0], rep.Status)
 			return nil
 		},
@@ -766,8 +770,13 @@ func answerCmd() *cobra.Command {
 				return err
 			}
 			defer printHeld(cmd, r)
-			if _, err := r.Answer(cmd.Context(), args[0], strings.Join(args[1:], " ")); err != nil {
+			res, err := r.Answer(cmd.Context(), args[0], strings.Join(args[1:], " "))
+			if err != nil {
 				return err
+			}
+			if res.Status == envelope.StatusHeld {
+				cmd.Printf("Answer to %s is held for approval (%s).\n", args[0], res.ID)
+				return nil
 			}
 			cmd.Printf("Answered clarification; resumed %s.\n", args[0])
 			return nil

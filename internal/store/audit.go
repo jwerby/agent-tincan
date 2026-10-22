@@ -185,7 +185,7 @@ type TraceStep = envelope.Result
 
 // Trace returns every request in a chain, in the order they were sent.
 func (s *Store) Trace(ctx context.Context, traceID string) ([]TraceStep, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM requests WHERE trace_id = ? ORDER BY created_at, hop`, traceID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM requests WHERE trace_id = ? AND gate_action = '' ORDER BY created_at, hop`, traceID)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +209,9 @@ func (s *Store) Trace(ctx context.Context, traceID string) ([]TraceStep, error) 
 		if err != nil {
 			return nil, err
 		}
+		if err := s.hideHeldProgress(ctx, &req); err != nil {
+			return nil, err
+		}
 		out = append(out, TraceStep{Request: req, Status: st, Reply: rep, Progress: req.Progress, Exchanges: req.Exchanges})
 	}
 	return out, nil
@@ -216,7 +219,7 @@ func (s *Store) Trace(ctx context.Context, traceID string) ([]TraceStep, error) 
 
 // RecentTraces returns the newest chain ids with their first request.
 func (s *Store) RecentTraces(ctx context.Context, limit int, excludePings bool) ([]TraceStep, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+requestCols+` FROM requests WHERE hop = 1 AND (? = 0 OR kind != 'ping') ORDER BY created_at DESC LIMIT ?`, excludePings, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+requestCols+` FROM requests WHERE hop = 1 AND gate_action = '' AND (? = 0 OR kind != 'ping') ORDER BY created_at DESC LIMIT ?`, excludePings, limit)
 	if err != nil {
 		return nil, err
 	}

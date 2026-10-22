@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -134,7 +135,7 @@ with --upgrade-exit exits with status 75 for its supervisor to restart it.`,
 			return err
 		},
 	}
-	cmd.Flags().StringVar(&f.listen, "listen", "", "bind this host tailnet IP (100.x.y.z) instead of starting tsnet")
+	cmd.Flags().StringVar(&f.listen, "listen", "", "bind this host's Tailscale address (100.64.0.0/10 or fd7a:115c:a1e0::/48) instead of starting tsnet")
 	cmd.Flags().StringVar(&f.hostname, "hostname", "tincan-relay", "tsnet node name")
 	cmd.Flags().StringVar(&f.stateDir, "state-dir", defaultStateDir(), "relay state: database, tsnet state, admin socket")
 	cmd.Flags().IntVar(&f.port, "port", 80, "port to serve the agent API on")
@@ -341,11 +342,42 @@ func defaultStateDir() string {
 	return ".tincan-relay"
 }
 
-// listenAddr parses --listen: a tailnet IPv4 address (100.x.y.z), with
-// an optional :port that overrides port. Anything else is refused, so a
-// typo fails before the relay creates its state.
+// listenOwner is what the local tailscaled reports for a candidate --listen
+// address: this node's id and Tailscale addresses, and the node WhoIs
+// attributes the address to.
+type listenOwner struct {
+	SelfID  string
+	SelfIPs []netip.Addr
+	WhoID   string
+}
+
+// lookupListenOwner asks the local daemon. A status or WhoIs failure is an
+// error, which --listen treats as a refusal.
+var lookupListenOwner = func(ctx context.Context, hostport string) (listenOwner, error) {
+	r := identity.NewLocalResolverAt("")
+	id, ips, err := r.Self(ctx)
+	if err != nil {
+		return listenOwner{}, err
+	}
+	who, err := r.WhoIs(ctx, hostport)
+	if err != nil {
+		return listenOwner{}, err
+	}
+	return listenOwner{SelfID: id, SelfIPs: ips, WhoID: who.ID}, nil
+}
+
+func containsAddr(ips []netip.Addr, ip netip.Addr) bool {
+	ip = ip.Unmap()
+	for _, have := range ips {
+		if have.Unmap() == ip {
+			return true
+		}
+	}
+	return false
+}
+
 func listenAddr(listen string, port int) (string, error) {
-	bad := fmt.Errorf("--listen must be a tailnet 100.x address, got %q", listen)
+	bad := fmt.Errorf("--listen must be a Tailscale address, got %q", listen)
 	host := strings.TrimSpace(listen)
 	if h, p, err := net.SplitHostPort(host); err == nil {
 		n, perr := strconv.Atoi(p)
@@ -354,8 +386,21 @@ func listenAddr(listen string, port int) (string, error) {
 		}
 		host, port = h, n
 	}
-	ip := net.ParseIP(host).To4()
-	if ip == nil || ip[0] != 100 || strings.Contains(host, ":") {
+	ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err != nil {
+		return "", bad
+	}
+	ip = ip.Unmap()
+	if !ip.IsValid() || ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() {
+		return "", bad
+	}
+	// Only this node's own Tailscale addresses. A CGNAT or ULA address that
+	// the daemon does not attribute to self, a peer address WhoIs resolves,
+	// and any WhoIs or daemon failure are refusals.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	owner, err := lookupListenOwner(ctx, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	if err != nil || owner.WhoID == "" || owner.SelfID == "" || owner.WhoID != owner.SelfID || !containsAddr(owner.SelfIPs, ip) {
 		return "", bad
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
@@ -393,6 +438,9 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	if err := os.MkdirAll(f.stateDir, 0o700); err != nil {
 		return err
 	}
+	if err := secureStateDir(f.stateDir); err != nil {
+		return err
+	}
 	pepper, err := loadOrCreateInvitePepper(f.stateDir)
 	if err != nil {
 		return err
@@ -403,6 +451,9 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	}
 	st, err := store.Open(filepath.Join(f.stateDir, "relay.db"))
 	if err != nil {
+		return err
+	}
+	if err := secureStateDir(f.stateDir); err != nil {
 		return err
 	}
 	closeStore := sync.OnceFunc(func() {
@@ -511,6 +562,9 @@ func runRelay(ctx context.Context, f relayFlags) error {
 		go func() { errc <- gw.Serve(gln) }()
 		servers = append(servers, gw)
 		log.Printf("chatgpt gateway serving at %s/mcp", base)
+	}
+	if err := secureStateDir(f.stateDir); err != nil {
+		return err
 	}
 	log.Printf("tincan relay serving on %s (admin socket %s)", ln.Addr(), adminSock)
 

@@ -95,12 +95,16 @@ const (
 	emailClaimed     = "claimed"
 	emailUnsupported = "unsupported"
 	emailTooLong     = "too_long"
+	emailHeld        = "held"
+	emailHeldPending = "held_pending"
 )
 
 // emailResponses is the email back for each outcome. None carries request
 // or reply text.
 var emailResponses = map[string]string{
 	store.EmailOutcomeRecorded: "Agent Tincan: recorded. Your reply is now your answer to this request, and your teammate has it.\n",
+	emailHeld:                  "Agent Tincan: recorded. Your reply is held for the owner's approval. Your teammate does not have it yet.\n",
+	emailHeldPending:           "Agent Tincan: not recorded: a reply to this request is already held for the owner's approval.\n",
 	emailOutOfDate: "Agent Tincan: not recorded: this email is out of date. The request has changed since this email was sent (or its tag is wrong). " +
 		"Answer from the latest request email, or through tincan.\n",
 	emailClosed:  "Agent Tincan: not recorded: this request was already answered, cancelled or expired. Nothing changed.\n",
@@ -256,9 +260,12 @@ func (s *Server) decideEmail(ctx context.Context, in EmailInbox, m wake.MailMess
 	if outcome != store.EmailOutcomeRecorded {
 		return s.decide(ctx, in, m.MessageID, id, outcome, true)
 	}
-	_, err = s.recordReply(ctx, id, in.Agent, rep, m.MessageID, round)
+	rep, err = s.recordReply(ctx, id, in.Agent, rep, m.MessageID, round, false)
 	switch {
 	case err == nil:
+		if rep.Status == envelope.StatusHeld {
+			outcome = emailHeld
+		}
 		s.respond(ctx, in, m.MessageID, outcome)
 		return true
 	case errors.Is(err, store.ErrEmailDecided):
@@ -266,6 +273,8 @@ func (s *Server) decideEmail(ctx context.Context, in EmailInbox, m wake.MailMess
 	case errors.Is(err, store.ErrLiveClaim):
 		// Claimed since judgeEmail looked.
 		return s.decide(ctx, in, m.MessageID, id, emailClaimed, true)
+	case errors.Is(err, store.ErrPendingHold):
+		return s.decide(ctx, in, m.MessageID, id, emailHeldPending, true)
 	case errors.Is(err, store.ErrWrongState):
 		return s.decide(ctx, in, m.MessageID, id, emailClosed, true)
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrForbidden), errors.Is(err, store.ErrStaleRound):

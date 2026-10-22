@@ -152,6 +152,7 @@ func TestServiceRunsApprovedCouncil(t *testing.T) {
 	if err := r.mesh.Client(t, "admin").Raw(t.Context(), "POST", "/v1/admin/requests/"+url.PathEscape(sent.ID)+"/approve", nil, nil); err != nil {
 		t.Fatal(err)
 	}
+	r.ungate()
 	res := r.await(sent.ID, 30*time.Second)
 	if res.Status != envelope.StatusAnswered {
 		t.Fatalf("status %s:\n%s", res.Status, res.Reply.Body)

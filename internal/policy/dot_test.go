@@ -84,6 +84,18 @@ func TestDotApprovalEntryOverridesDefault(t *testing.T) {
 	}
 }
 
+func TestWildcardTargetDoesNotDisableKindDefault(t *testing.T) {
+	f := newFixture(t, Config{Approval: approvalFile(t, `{"gate":{"*":{"from":[]}}}`)})
+	f.agent(t, "council", onboard.KindCouncil)
+	f.agent(t, "muse", onboard.KindCodex)
+	if req := prepare(t, f, "grokbot", "council", "", envelope.KindAsk); req.Status != envelope.StatusHeld {
+		t.Fatal("wildcard key disabled the council default")
+	}
+	if req := prepare(t, f, "grokbot", "muse", "", envelope.KindAsk); req.Status == envelope.StatusHeld {
+		t.Fatal("empty wildcard from list held an ordinary agent")
+	}
+}
+
 // Other kinds, and agents with no kind, are not held without an entry. That
 // includes every other web agent: only dot-web fronts an agent that acts in
 // the owner's apps.

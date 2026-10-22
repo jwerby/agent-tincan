@@ -37,8 +37,7 @@ func (w *wakes) count(agent string) int {
 
 // End to end through a real relay with no approval.json: an admin invites
 // dot-web with --kind dot-web, a teammate's ask to it is held and wakes
-// nothing, the owner's approval queues it and wakes dot-web, and the reply to
-// an ask dot-web sends for the dot comes back without a hold.
+// nothing, and the owner's approval queues it and wakes dot-web.
 func TestDotHoldAndApproveThroughRelay(t *testing.T) {
 	m := testrelay.New(t, relay.Config{})
 	w := &wakes{}
@@ -71,7 +70,6 @@ func TestDotHoldAndApproveThroughRelay(t *testing.T) {
 		t.Fatalf("dot inbox after approval: %+v %v", inbox, err)
 	}
 
-	// The dot's own ask is not held, and neither is the reply to it.
 	own, err := dot.Send(t.Context(), "grokbot", "what is on the calendar", envelope.KindAsk, "", false)
 	if err != nil || own.Status == envelope.StatusHeld {
 		t.Fatalf("dot's own ask = %q %v", own.Status, err)
@@ -80,7 +78,15 @@ func TestDotHoldAndApproveThroughRelay(t *testing.T) {
 	if _, err := grok.Claim(t.Context(), own.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := grok.Reply(t.Context(), own.ID, "two meetings", envelope.StatusAnswered); err != nil {
+	rep, err := grok.Reply(t.Context(), own.ID, "two meetings", envelope.StatusAnswered)
+	if err != nil || rep.Status != envelope.StatusHeld {
+		t.Fatalf("reply to the dot = %+v %v", rep, err)
+	}
+	early, err := dot.Get(t.Context(), own.ID, 0)
+	if err != nil || early.Status == envelope.StatusAnswered {
+		t.Fatalf("reply reached the dot before approval: %+v %v", early, err)
+	}
+	if err := admin.Raw(t.Context(), "POST", "/v1/admin/requests/"+rep.RequestID+"/approve", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	res, err := dot.Get(t.Context(), own.ID, time.Second)

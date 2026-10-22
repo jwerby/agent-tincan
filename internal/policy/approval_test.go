@@ -67,6 +67,8 @@ func TestApprovalInvalidPolicies(t *testing.T) {
 		`{"gate":{"muse":{"from":null}}}`, `{"gate":{"muse":{"unless":null}}}`,
 		`{"gate":{"muse":{"from":"*","unless":[]}}}`, `{"gate":{"muse":{"from":"everyone"}}}`,
 		`{"gate":{"muse":{"from":["bad name"]}}}`, `{"gate":{"Bad":{"from":"*"}}}`,
+		`{"gate":{"*muse":{"from":"*"}}}`, `{"gate":{"muse*":{"from":"*"}}}`, `{"gate":{"**":{"from":"*"}}}`,
+		`{"gate":{"*":{"from":["*"]}}}`,
 		`{"gate":{},"hold_ttl":"0s"}`, `{"gate":{},"hold_ttl":"bad"}`, `{"gate":{},"notify":"bad name"}`,
 		`{"gate":{},"typo":true}`, `{"gate":{}} {}`, `{"gate":{"muse":{"form":"*"}}}`,
 		`{"gate":{"muse":{"from":"*","from":[]}}}`, `{"gate":{"muse":{"from":"*"}},"gate":{}}`,
@@ -80,6 +82,35 @@ func TestApprovalInvalidPolicies(t *testing.T) {
 				t.Fatal("invalid policy accepted")
 			}
 		})
+	}
+}
+
+func TestApprovalWildcardTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approval.json")
+	if err := os.WriteFile(path, []byte(`{"gate":{"*":{"from":"*"}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := LoadApproval(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, to := range []string{"muse", "instinct", "grokbot"} {
+		req := envelope.Request{From: "grokbot", To: to, Chain: []string{"grokbot"}}
+		held, err := a.Held(&req)
+		if !held || err != nil {
+			t.Fatalf("%s: held %v err %v", to, held, err)
+		}
+	}
+	if err := os.WriteFile(path, []byte("{\"gate\":{\"\\u002a\":{\"from\":\"*\"},\"muse\":{\"from\":[]}}}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	muse := envelope.Request{From: "grokbot", To: "muse", Chain: []string{"grokbot"}}
+	if held, err := a.Held(&muse); held || err != nil {
+		t.Fatalf("named entry should override *: held %v err %v", held, err)
+	}
+	other := envelope.Request{From: "grokbot", To: "instinct", Chain: []string{"grokbot"}}
+	if held, err := a.Held(&other); !held || err != nil {
+		t.Fatalf("unlisted target: held %v err %v", held, err)
 	}
 }
 

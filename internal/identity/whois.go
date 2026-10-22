@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -97,6 +98,20 @@ func shortName(fqdn string) string {
 }
 
 var _ NodeStatus = (*LocalResolver)(nil)
+
+// Self reports this node's stable id and its Tailscale addresses from the
+// local daemon. --listen accepts an address only when it is one of these.
+func (r *LocalResolver) Self(ctx context.Context) (id string, ips []netip.Addr, err error) {
+	st, err := r.lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("tailnet status: %w", err)
+	}
+	if st.Self == nil {
+		return "", nil, fmt.Errorf("tailnet status: no self node")
+	}
+	ips = append([]netip.Addr(nil), st.Self.TailscaleIPs...)
+	return string(st.Self.ID), ips, nil
+}
 
 // SelfURLs are the relay URLs this tailnet node answers on for port: its
 // MagicDNS name first (it outlives an IP change), then its IPv4 address.
